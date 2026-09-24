@@ -61,7 +61,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # Job 2: Build, Healthcheck & Integration Test Gate (STRICT BLOCKING GATE)
+  # Job 2: Build, Healthcheck, Container Scan & Integration Test Gate
   # ============================================================================
   build-and-test:
     name: Build & Functional Integration Tests
@@ -84,6 +84,16 @@ jobs:
       - name: Build and Start Containers via Docker Compose
         run: |
           docker compose up -d --build
+
+      # Container Image Security Scan (Trivy - Non-blocking baseline)
+      - name: Run Trivy Container Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: 'vuln-bank-web'
+          format: 'table'
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM'
 
       - name: Poll Container Readiness (/healthz)
         run: |
