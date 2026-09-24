@@ -1,0 +1,126 @@
+name: CI Foundation - Build, Test & Security Scans
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # ============================================================================
+  # Job 1: Static Security Analysis (Non-blocking findings discovery)
+  # ============================================================================
+  security-scans:
+    name: Security Scans (SCA, SAST, Secrets)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python for Security Tools
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Static Analysis Scanners
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install bandit pip-audit
+
+      # 1. Secret Scanning via Gitleaks
+      - name: Run Gitleaks Secret Scanner
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Dependency Vulnerability Scanning (SCA)
+      - name: Run Dependency SCA (pip-audit)
+        id: sca_scan
+        continue-on-error: true
+        run: |
+          echo "### 📦 Dependency SCA Report (pip-audit)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          pip-audit -r requirements.txt | tee -a $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # 3. Static Application Security Testing (SAST)
+      - name: Run SAST Scanner (Bandit)
+        id: sast_scan
+        continue-on-error: true
+        run: |
+          echo "### 🛡️ SAST Security Report (Bandit)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          bandit -r . -x ./tests -f screen | tee -a $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Job 2: Build, Healthcheck & Integration Test Gate (STRICT BLOCKING GATE)
+  # ============================================================================
+  build-and-test:
+    name: Build & Functional Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Test Harness
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Integration Test Runner Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest requests
+
+      - name: Build and Start Containers via Docker Compose
+        run: |
+          docker compose up -d --build
+
+      - name: Poll Container Readiness (/healthz)
+        run: |
+          echo "Waiting for VulnBank application to respond on /healthz..."
+          TIMEOUT=60
+          ELAPSED=0
+          until curl -s -f http://localhost:5000/healthz > /dev/null 2>&1; do
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "Timed out waiting for web container readiness!"
+              docker compose ps
+              docker compose logs
+              exit 1
+            fi
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+            echo "Waiting... (${ELAPSED}s elapsed)"
+          done
+          echo "Application is healthy and listening on port 5000."
+
+      - name: Run Phase 2 Functional Integration Tests
+        id: integration_tests
+        env:
+          TARGET_URL: http://localhost:5000
+        run: |
+          python -m pytest -v tests/test_health.py tests/test_auth_boundary.py tests/test_banking_operations.py
+
+      - name: Dump Container Logs on Failure
+        if: failure()
+        run: |
+          echo "=== Container Process State ==="
+          docker compose ps
+          echo "=== Web Application Logs ==="
+          docker compose logs web
+          echo "=== Database Logs ==="
+          docker compose logs db
+
+      - name: Clean Up Docker Compose Stack
+        if: always()
+        run: |
+          docker compose down -v
